@@ -48,15 +48,20 @@ in th_results is copied from the original in EEMBC.
 
 UnbufferedSerial pc(USBTX, USBRX, 115200);
 
-constexpr int kTensorArenaSize = 50 * 1024;
+constexpr int kTensorArenaSize = 100 * 1024;
 uint8_t tensor_arena[kTensorArenaSize];
 
-tflite::MicroModelRunner<int8_t, int8_t, 7> *runner;
+int8_t input_quantized[kIcInputSize];
+ 
+//tflite::MicroModelRunner<int8_t, int8_t, 7> *runner;
+tflite::ErrorReporter* error_reporter = nullptr;
+tflite::MicroInterpreter* interpreter = nullptr;
+const tflite::Model* model = nullptr;
+TfLiteTensor* model_input = nullptr;
 
+  
 // Implement this method to prepare for inference and preprocess inputs.
 void th_load_tensor() {
-  int8_t input_quantized[kIcInputSize];
-
   size_t bytes = ee_get_buffer(reinterpret_cast<uint8_t *>(input_quantized),
                                kIcInputSize * sizeof(uint8_t));
   if (bytes / sizeof(uint8_t) != kIcInputSize) {
@@ -65,22 +70,32 @@ void th_load_tensor() {
     return;
   }
  
-  runner->SetInput(input_quantized);
+ /*
+  //runner->SetInput(input_quantized);
+      // Populate input tensor with an image with no person.
+    TfLiteTensor* input = interpreter->input(0);
+    int8_t* input_buffer = tflite::GetTensorData<int8_t>(input);
+    int input_length = input->bytes / sizeof(int8_t);
+    for (int i = 0; i < input_length; i++) {
+      input_buffer[i] = input_quantized[i];
+    }
+    * */
 }
 
 // Add to this method to return real inference results.
 void th_results() {
-  const int nresults = 3;
+  const int nresults = 10;
   /**
    * The results need to be printed back in exactly this format; if easier
    * to just modify this loop than copy to results[] above, do that.
    */
   th_printf("m-results-[");
   int kCategoryCount = 10;
+  TfLiteTensor* output = interpreter->output(0);
   for (size_t i = 0; i < kCategoryCount; i++) {
     float converted =
-        DequantizeInt8ToFloat(runner->GetOutput()[i], runner->output_scale(),
-                              runner->output_zero_point());
+        DequantizeInt8ToFloat(output->data.int8[i], interpreter->output(0)->params.scale,
+                                              interpreter->output(0)->params.zero_point);
     th_printf("%0.3f", converted);
     if (i < (nresults - 1)) {
       th_printf(",");
@@ -90,11 +105,16 @@ void th_results() {
 }
 
 // Implement this method with the logic to perform one inference cycle.
-void th_infer() { runner->Invoke(); }
+void th_infer() { interpreter->Invoke();}//runner->Invoke(); }
 
 /// \brief optional API.
 void th_final_initialize(void) {
-  tflite::MicroMutableOpResolver<7> resolver;
+  static tflite::MicroErrorReporter micro_error_reporter;
+  error_reporter = &micro_error_reporter;
+  
+  model = tflite::GetModel(pretrainedResnet_quant_tflite);
+ 
+  static tflite::MicroMutableOpResolver<7> resolver(error_reporter);
   resolver.AddAdd();
   resolver.AddFullyConnected();
   resolver.AddConv2D();
@@ -102,9 +122,36 @@ void th_final_initialize(void) {
   resolver.AddReshape();
   resolver.AddSoftmax();
   resolver.AddAveragePool2D();
-  static tflite::MicroModelRunner<int8_t, int8_t, 7> model_runner(
-      pretrainedResnet_quant_tflite, resolver, tensor_arena, kTensorArenaSize);
-  runner = &model_runner;
+ // static tflite::MicroModelRunner<int8_t, int8_t, 7> model_runner(
+   //   pretrainedResnet_quant_tflite, resolver, tensor_arena, kTensorArenaSize);
+   
+   model = tflite::GetModel(pretrainedResnet_quant_tflite);
+
+      	// from runner to interpreter
+  // Build an interpreter to run the model with.
+  static tflite::MicroInterpreter static_interpreter(
+      model, resolver, tensor_arena, kTensorArenaSize, error_reporter);
+  interpreter = &static_interpreter;
+  //runner = &model_runner;
+  
+    // Allocate memory from the tensor_arena for the model's tensors.
+  TfLiteStatus allocate_status = interpreter->AllocateTensors();
+  if (allocate_status != kTfLiteOk) {
+    TF_LITE_REPORT_ERROR(error_reporter, "AllocateTensors() failed");
+    return;
+  }
+  
+    // Get information about the memory area to use for the model's input.
+  model_input = interpreter->input(0);
+  if ((model_input->dims->size != 3) || (model_input->dims->data[0] != 1) ||
+      (model_input->dims->data[1] !=
+       (3072)) ||
+      (model_input->type != kTfLiteInt8)) {
+    TF_LITE_REPORT_ERROR(error_reporter,
+                         "Bad input tensor parameters in model");
+    return;
+  }
+  th_printf("Initialized\r\n");
 }
 void th_pre() {}
 void th_post() {}
